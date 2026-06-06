@@ -94,7 +94,7 @@ docker run -d -p 6379:6379 --name tabtwin-redis redis:7-alpine
 
 Then add the following to your `.env` file (already present in `.env.example`):
 
-```env
+```
 REDIS_URL=redis://localhost:6379
 ```
 
