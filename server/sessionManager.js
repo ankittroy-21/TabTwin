@@ -1,5 +1,10 @@
-// Owns in-memory session state for the TabTwin MVP signaling server.
+// Owns session state for the TabTwin signaling server.
+// Serialisable session data lives in Redis (ioredis); WebSocket socket
+// references that cannot cross process boundaries are kept in an in-process
+// socketStore Map keyed by sessionId.
 import crypto from 'node:crypto';
+
+const SESSION_TTL_SECONDS = 86_400; // 24 hours
 
 const DEFAULT_PERMISSIONS = {
   canHighlight: true,
@@ -12,90 +17,187 @@ const DEFAULT_PERMISSIONS = {
 
 const GUEST_COLORS = ['#2563eb', '#16a34a', '#dc2626', '#9333ea', '#ea580c', '#0891b2'];
 
-export function createSessionManager({ clientUrl }) {
-  const sessions = new Map();
+/** @param {string} id */
+function redisKey(id) {
+  return `tabtwin:session:${id}`;
+}
 
-  function createSession({ hostName = 'Host' } = {}) {
+/**
+ * Creates the session manager backed by the supplied ioredis client.
+ *
+ * @param {{ clientUrl: string, redisClient: import('ioredis').Redis }} options
+ */
+export function createSessionManager({ clientUrl, redisClient }) {
+  // In-process store for socket references only.
+  // Shape: Map<sessionId, { hostSocket: WebSocket|null, guests: Array<{ id, socket }> }>
+  const socketStore = new Map();
+
+  // ---------- helpers ----------
+
+  async function _save(session) {
+    await redisClient.set(redisKey(session.id), JSON.stringify(session), 'EX', SESSION_TTL_SECONDS);
+  }
+
+  async function _load(id) {
+    const raw = await redisClient.get(redisKey(id));
+    return raw ? JSON.parse(raw) : null;
+  }
+
+  /** Merge serialisable session data with the live socket references. */
+  function _hydrate(data) {
+    if (!data) return null;
+    const sockets = socketStore.get(data.id) || { hostSocket: null, guests: [] };
+    return {
+      ...data,
+      hostSocket: sockets.hostSocket,
+      guests: data.guests.map((g) => {
+        const live = sockets.guests.find((s) => s.id === g.id);
+        return { ...g, socket: live?.socket ?? null };
+      })
+    };
+  }
+
+  function _socketEntry(sessionId) {
+    if (!socketStore.has(sessionId)) {
+      socketStore.set(sessionId, { hostSocket: null, guests: [] });
+    }
+    return socketStore.get(sessionId);
+  }
+
+  // ---------- public API ----------
+
+  async function createSession({ hostName = 'Host' } = {}) {
     const id = crypto.randomBytes(4).toString('hex');
     const session = {
       id,
       hostName,
       link: `${clientUrl.replace(/\/$/, '')}/join/${id}`,
       createdAt: new Date().toISOString(),
-      hostSocket: null,
+      // hostSocket is NOT stored in Redis — it lives only in socketStore.
       guests: [],
       permissions: { ...DEFAULT_PERMISSIONS },
       activityLog: []
     };
 
-    sessions.set(id, session);
-    return session;
+    await _save(session);
+    socketStore.set(id, { hostSocket: null, guests: [] });
+    return _hydrate(session);
   }
 
-  function getSession(id) {
-    return sessions.get(id) || null;
+  async function getSession(id) {
+    const data = await _load(id);
+    return _hydrate(data);
   }
 
-  function endSession(id) {
-    const session = sessions.get(id);
-    if (!session) return false;
+  async function endSession(id) {
+    const data = await _load(id);
+    if (!data) return false;
 
-    for (const guest of session.guests) {
-      safeSend(guest.socket, { event: 'control:revoke', payload: { reason: 'session-ended' } });
-      guest.socket?.close?.(1000, 'Session ended');
+    const sockets = socketStore.get(id);
+    if (sockets) {
+      for (const { socket } of sockets.guests) {
+        safeSend(socket, { event: 'control:revoke', payload: { reason: 'session-ended' } });
+        socket?.close?.(1000, 'Session ended');
+      }
+      safeSend(sockets.hostSocket, { event: 'session:ended', payload: { sessionId: id } });
+      sockets.hostSocket?.close?.(1000, 'Session ended');
     }
-    safeSend(session.hostSocket, { event: 'session:ended', payload: { sessionId: id } });
-    session.hostSocket?.close?.(1000, 'Session ended');
-    sessions.delete(id);
+
+    await redisClient.del(redisKey(id));
+    socketStore.delete(id);
     return true;
   }
 
-  function attachHost(sessionId, socket) {
-    const session = getSession(sessionId);
-    if (!session) return null;
-    session.hostSocket = socket;
-    session.activityLog.unshift({ at: Date.now(), message: 'Host connected' });
-    return session;
+  async function attachHost(sessionId, socket) {
+    const data = await _load(sessionId);
+    if (!data) return null;
+
+    data.activityLog.unshift({ at: Date.now(), message: 'Host connected' });
+    await _save(data);
+
+    const entry = _socketEntry(sessionId);
+    entry.hostSocket = socket;
+
+    return _hydrate(data);
   }
 
-  function addGuest(sessionId, socket, { name = 'Guest' } = {}) {
-    const session = getSession(sessionId);
-    if (!session) return null;
+  async function addGuest(sessionId, socket, { name = 'Guest' } = {}) {
+    const data = await _load(sessionId);
+    if (!data) return null;
 
-    const guest = {
-      id: crypto.randomBytes(6).toString('hex'),
+    const guestId = crypto.randomBytes(6).toString('hex');
+    const guestData = {
+      id: guestId,
       name,
-      color: GUEST_COLORS[session.guests.length % GUEST_COLORS.length],
-      socket,
+      color: GUEST_COLORS[data.guests.length % GUEST_COLORS.length],
       permissions: { ...DEFAULT_PERMISSIONS }
+      // socket is NOT stored in Redis.
     };
 
-    session.guests.push(guest);
-    session.activityLog.unshift({ at: Date.now(), message: `${name} joined` });
+    data.guests.push(guestData);
+    data.activityLog.unshift({ at: Date.now(), message: `${name} joined` });
+    await _save(data);
+
+    const entry = _socketEntry(sessionId);
+    entry.guests.push({ id: guestId, socket });
+
+    const session = _hydrate(data);
+    const guest = session.guests.find((g) => g.id === guestId);
     return { session, guest };
   }
 
-  function removeSocket(socket) {
-    for (const session of sessions.values()) {
-      if (session.hostSocket === socket) {
-        session.hostSocket = null;
-        session.activityLog.unshift({ at: Date.now(), message: 'Host disconnected' });
+  async function removeSocket(socket) {
+    for (const [sessionId, sockets] of socketStore) {
+      let changed = false;
+
+      if (sockets.hostSocket === socket) {
+        sockets.hostSocket = null;
+        const data = await _load(sessionId);
+        if (data) {
+          data.activityLog.unshift({ at: Date.now(), message: 'Host disconnected' });
+          await _save(data);
+        }
+        changed = true;
       }
 
-      const before = session.guests.length;
-      session.guests = session.guests.filter((guest) => guest.socket !== socket);
-      if (before !== session.guests.length) {
-        session.activityLog.unshift({ at: Date.now(), message: 'Guest disconnected' });
-        safeSend(session.hostSocket, {
-          event: 'session:guest-left',
-          payload: { guests: publicGuests(session) }
-        });
+      const before = sockets.guests.length;
+      sockets.guests = sockets.guests.filter((g) => g.socket !== socket);
+
+      if (before !== sockets.guests.length) {
+        const data = await _load(sessionId);
+        if (data) {
+          const removedIds = new Set(
+            [...Array(before - sockets.guests.length)].map(() => null) // placeholder
+          );
+          // Sync Redis guest list to match the in-process list of remaining IDs.
+          const remainingIds = new Set(sockets.guests.map((g) => g.id));
+          data.guests = data.guests.filter((g) => remainingIds.has(g.id));
+          data.activityLog.unshift({ at: Date.now(), message: 'Guest disconnected' });
+          await _save(data);
+        }
+
+        const hostSocket = sockets.hostSocket;
+        const updatedData = await _load(sessionId);
+        if (updatedData) {
+          safeSend(hostSocket, {
+            event: 'session:guest-left',
+            payload: { guests: publicGuests(_hydrate(updatedData)) }
+          });
+        }
+        changed = true;
+      }
+
+      // Clean up socketStore for sessions that have no live sockets at all.
+      if (sockets.hostSocket === null && sockets.guests.length === 0 && !changed) {
+        // Leave the Redis key intact — the session is still valid; just no one is connected right now.
       }
     }
   }
 
-  function count() {
-    return sessions.size;
+  async function count() {
+    // Count keys matching the session namespace.
+    const keys = await redisClient.keys('tabtwin:session:*');
+    return keys.length;
   }
 
   return {
@@ -122,5 +224,3 @@ export function safeSend(socket, message) {
   if (!socket || socket.readyState !== 1) return;
   socket.send(JSON.stringify(message));
 }
-
-// TODO: Replace in-memory session storage with Redis for multi-instance deployments.

@@ -22,11 +22,11 @@ export function createSignalingHandler({ sessions }) {
 
   async function routeMessage(socket, { event, payload = {} }) {
     const sessionId = payload.sessionId || socket.tabTwin.sessionId;
-    const session = sessionId ? sessions.getSession(sessionId) : null;
+    const session = sessionId ? await sessions.getSession(sessionId) : null;
 
     switch (event) {
       case 'host:connect': {
-        const nextSession = sessions.attachHost(payload.sessionId, socket);
+        const nextSession = await sessions.attachHost(payload.sessionId, socket);
         if (!nextSession) {
           safeSend(socket, { event: 'error', payload: { message: 'Session not found.' } });
           return;
@@ -41,7 +41,7 @@ export function createSignalingHandler({ sessions }) {
       }
 
       case 'session:join': {
-        const joined = sessions.addGuest(payload.sessionId, socket, { name: payload.name });
+        const joined = await sessions.addGuest(payload.sessionId, socket, { name: payload.name });
         if (!joined) {
           safeSend(socket, { event: 'error', payload: { message: 'Session not found.' } });
           return;

@@ -80,6 +80,25 @@ Open the link the host shares. That is it.
 | `ANTHROPIC_API_KEY` | Optional for local fallback, required for Claude actions | Claude API key used by the AI agent.                                                 |
 | `PORT`              | No                                                       | Server port. Defaults to `3001`.                                                     |
 | `CLIENT_URL`        | No                                                       | Web app origin used when generating join links. Defaults to `http://localhost:5173`. |
+| `REDIS_URL`         | **Yes**                                                  | ioredis connection URL for session storage. Example: `redis://localhost:6379`.       |
+
+## Redis
+
+TabTwin stores session state in Redis so sessions survive server restarts and the server can scale horizontally. You must have a Redis instance running before starting the server.
+
+**Local development (Docker)**
+
+```bash
+docker run -d -p 6379:6379 --name tabtwin-redis redis:7-alpine
+```
+
+Then add the following to your `.env` file (already present in `.env.example`):
+
+```
+REDIS_URL=redis://localhost:6379
+```
+
+If `REDIS_URL` is not set the server will exit immediately with a clear error message telling you what to do.
 
 ## Loading The Extension Locally
 
