@@ -183,15 +183,21 @@ export function createSessionManager({ clientUrl, redisClient }) {
         changed = true;
       }
 
-      const before = sockets.guests.length;
+      // Identify the guest that just left before the local list is filtered.
+      const disconnectedIds = new Set(
+        sockets.guests
+          .filter((g) => g.socket === socket)
+          .map((g) => g.id)
+      );
       sockets.guests = sockets.guests.filter((g) => g.socket !== socket);
 
-      if (before !== sockets.guests.length) {
+      if (disconnectedIds.size > 0) {
         const data = await _load(sessionId);
         if (data) {
-          // Sync Redis guest list to match the in-process list of remaining IDs.
-          const remainingIds = new Set(sockets.guests.map((g) => g.id));
-          data.guests = data.guests.filter((g) => remainingIds.has(g.id));
+          // Remove only the specific guest(s) that disconnected from this instance.
+          // Using the disconnected ID rather than a local-socket allowlist avoids
+          // wiping guests whose sockets live on other server instances.
+          data.guests = data.guests.filter((g) => !disconnectedIds.has(g.id));
           data.activityLog.unshift({ at: Date.now(), message: 'Guest disconnected' });
           await _save(data);
         }
