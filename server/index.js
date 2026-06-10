@@ -2,6 +2,7 @@
 import express from 'express';
 import cors from 'cors';
 import http from 'node:http';
+import crypto from 'node:crypto';
 import { WebSocketServer } from 'ws';
 import Redis from 'ioredis';
 import { createSessionManager } from './sessionManager.js';
@@ -26,13 +27,23 @@ const redisClient = new Redis(REDIS_URL, {
   lazyConnect: false
 });
 
+const redisSub = new Redis(REDIS_URL, {
+  maxRetriesPerRequest: null // Subscribers should keep trying to reconnect
+});
+
+const SERVER_ID = crypto.randomUUID();
+
 redisClient.on('error', (err) => {
   console.error('[TabTwin] Redis connection error:', err.message);
 });
 
+redisSub.on('error', (err) => {
+  console.error('[TabTwin] Redis Sub connection error:', err.message);
+});
+
 const app = express();
 const server = http.createServer(app);
-const sessions = createSessionManager({ clientUrl: CLIENT_URL, redisClient });
+const sessions = createSessionManager({ clientUrl: CLIENT_URL, redisClient, serverId: SERVER_ID });
 
 app.use(cors({ origin: true }));
 app.use(express.json({ limit: '1mb' }));
@@ -96,7 +107,12 @@ app.use((err, _req, res, _next) => {
 });
 
 const wss = new WebSocketServer({ server });
-const signaling = createSignalingHandler({ sessions });
+const signaling = createSignalingHandler({ 
+  sessions, 
+  redisClient, 
+  redisSub, 
+  serverId: SERVER_ID 
+});
 wss.on('connection', signaling.handleConnection);
 
 server.listen(PORT, () => {
